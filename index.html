@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Private Live Classroom</title>
+    <style>
+        body { font-family: sans-serif; background: #121212; color: #fff; margin: 0; padding: 10px; }
+        #login-box { max-width: 320px; margin: 60px auto; background: #1e1e1e; padding: 20px; border-radius: 8px; }
+        input, select, button { width: 100%; padding: 10px; margin: 8px 0; border-radius: 4px; border: none; box-sizing: border-box; }
+        button { background: #28a745; color: white; font-weight: bold; cursor: pointer; }
+        #classroom { display: none; max-width: 900px; margin: auto; }
+        video { width: 100%; max-height: 280px; background: #000; border-radius: 6px; }
+        canvas { background: #fff; border-radius: 6px; width: 100%; height: 250px; touch-action: none; }
+        #chat-box { height: 150px; overflow-y: auto; background: #1e1e1e; padding: 10px; border-radius: 6px; margin-top: 10px; }
+        .teacher-only { display: none; }
+    </style>
+</head>
+<body>
+
+    <!-- PRIVATE LOGIN SCREEN -->
+    <div id="login-box">
+        <h3>Join Private Class</h3>
+        <input type="text" id="username" placeholder="Your Name" required>
+        <select id="role">
+            <option value="student">Student</option>
+            <option value="teacher">Teacher</option>
+        </select>
+        <input type="password" id="password" placeholder="Room Password" required>
+        <button onclick="joinClass()">Enter Classroom</button>
+        <p id="error-msg" style="color: #ff5555;"></p>
+    </div>
+
+    <!-- MAIN CLASSROOM -->
+    <div id="classroom">
+        <h3 id="welcome-title">Live Class</h3>
+        
+        <!-- Live Video / Screen Stream -->
+        <video id="video" autoplay playsinline></video>
+        <div class="teacher-only" id="teacher-controls">
+            <button onclick="startBroadcast(false)">Start Mic & Camera</button>
+            <button onclick="startBroadcast(true)" style="background:#007bff;">Share Screen & Mic</button>
+        </div>
+
+        <!-- Shared Whiteboard -->
+        <h4>Live Whiteboard</h4>
+        <canvas id="board" width="600" height="250"></canvas>
+        <button class="teacher-only" id="clear-btn" onclick="clearBoard()" style="background:#dc3545;">Clear Whiteboard</button>
+
+        <!-- Live Chat -->
+        <div id="chat-box"></div>
+        <div style="display:flex; gap:5px;">
+            <input type="text" id="chat-input" placeholder="Type a message...">
+            <button onclick="sendChat()" style="width:30%;">Send</button>
+        </div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+        let myName = '';
+        let myRole = '';
+        let localStream = null;
+        const peerConnections = {};
+        const rtcConfig = { iceServers: [{ urls: 'stun:://google.com' }] };
+
+        function joinClass() {
+            myName = document.getElementById('username').value.trim();
+            myRole = document.getElementById('role').value;
+            const password = document.getElementById('password').value;
+            if (!myName || !password) return;
+            socket.emit('join-room', { name: myName, password, role: myRole });
+        }
+
+        socket.on('auth-fail', (msg) => {
+            document.getElementById('error-msg').innerText = msg;
+        });
+
+        socket.on('auth-success', ({ role }) => {
+            document.getElementById('login-box').style.display = 'none';
+            document.getElementById('classroom').style.display = 'block';
+            if (role === 'teacher') {
+                document.getElementById('teacher-controls').style.display = 'block';
+                document.getElementById('clear-btn').style.display = 'block';
+                document.getElementById('video').muted = true; // Prevent echo
+            }
+        });
+
+        // --- CHAT LOGIC ---
+        function sendChat() {
+            const input = document.getElementById('chat-input');
+            if (!input.value.trim()) return;
+            socket.emit('send-chat', { sender: myName, text: input.value });
+            input.value = '';
+        }
+
+        socket.on('chat-msg', (data) => {
+            const box = document.getElementById('chat-box');
+            box.innerHTML += `<div><strong>${data.sender}:</strong> ${data.text}</div>`;
+            box.scrollTop = box.scrollHeight;
+        });
+
+        // --- WHITEBOARD LOGIC ---
+        const canvas = document.getElementById('board');
+        const ctx = canvas.getContext('2d');
+        let drawing = false;
+
+        function getPos(e) {
+            const rect = canvas.getBoundingClientRect();
+            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+            return {
+                x: (clientX - rect.left) * (canvas.width / rect.width),
+                y: (clientY - rect.top) * (canvas.height / rect.height)
+            };
+        }
+
+        canvas.addEventListener('pointerdown', (e) => {
+            if (myRole !== 'teacher') return;
+            drawing = true;
+            const pos = getPos(e);
+            ctx.beginPath();
+            ctx.moveTo(pos.x, pos.y);
+            socket.emit('draw', { type: 'start', x: pos.x, y: pos.y });
+        });
+
+        canvas.addEventListener('pointermove', (e) => {
+            if (!drawing || myRole !== 'teacher') return;
+            const pos = getPos(e);
+            ctx.lineTo(pos.x, pos.y);
+            ctx.stroke();
+            socket.emit('draw', { type: 'move', x: pos.x, y: pos.y });
+        });
+
+        canvas.addEventListener('pointerup', () => { drawing = false; });
+
+        socket.on('draw', (data) => {
+            if (data.type === 'start') {
+                ctx.beginPath();
+                ctx.moveTo(data.x, data.y);
+            } else {
+                ctx.lineTo(data.x, data.y);
+                ctx.stroke();
+            }
+        });
+
+        function clearBoard() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            socket.emit('clear-board');
+        }
+        socket.on('clear-board', () => ctx.clearRect(0, 0, canvas.width, canvas.height));
+
+        // --- WEBRTC LIVE STREAMING (TEACHER TO STUDENTS) ---
+        async function startBroadcast(useScreen) {
+            try {
+                localStream = useScreen 
+                    ? await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
+                    : await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                document.getElementById('video').srcObject = localStream;
+            } catch (err) {
+                alert("Could not access camera/screen: " + err.message);
+            }
+        }
+
+        socket.on('student-joined', (studentId) => {
+            if (!localStream) return;
+            const pc = new RTCPeerConnection(rtcConfig);
+            peerConnections[studentId] = pc;
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+            pc.onicecandidate = (e) => {
+                if (e.candidate) socket.emit('candidate', studentId, e.candidate);
+            };
+
+            pc.createOffer()
+                .then(offer => pc.setLocalDescription(offer))
+                .then(() => socket.emit('offer', studentId, pc.localDescription));
+        });
+
+        socket.on('offer', (teacherId, description) => {
+            const pc = new RTCPeerConnection(rtcConfig);
+            peerConnections[teacherId] = pc;
+            pc.setRemoteDescription(description)
+                .then(() => pc.createAnswer())
+                .then(answer => pc.setLocalDescription(answer))
+                .then(() => socket.emit('answer', teacherId, pc.localDescription));
+
+            pc.ontrack = (e) => {
+                document.getElementById('video').srcObject = e.streams[0];
+            };
+            pc.onicecandidate = (e) => {
+                if (e.candidate) socket.emit('candidate', teacherId, e.candidate);
+            };
+        });
+
+        socket.on('answer', (id, description) => {
+            peerConnections[id]?.setRemoteDescription(description);
+        });
+
+        socket.on('candidate', (id, candidate) => {
+            peerConnections[id]?.addIceCandidate(new RTCIceCandidate(candidate));
+        });
+    </script>
+</body>
+</html>
